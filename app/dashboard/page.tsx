@@ -1,12 +1,24 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
-import { task, addComment, getComments } from "@/services/task";
+import { useEffect, useState } from "react";
+import {
+  task,
+  addComment,
+  getComments,
+  deleteTask,
+  updateTask,
+} from "@/services/task";
 import KanbanSkeleton from "@/components/skeleton/kanbanboard";
 import { CommentSkeleton } from "@/components/skeleton/comment";
-import { deleteTask } from "@/services/task";
 import { Trash2 } from "lucide-react";
 import { getProfile } from "@/services/user";
+import {
+  DndContext,
+  closestCorners,
+  useDroppable,
+  useDraggable,
+} from "@dnd-kit/core";
+import { socket } from "@/lib/socket";
 
 type Task = {
   id: number;
@@ -17,17 +29,15 @@ type Task = {
   assignment_type?: string;
   assigned_by?: { first_name: string };
   status: "TODO" | "IN_PROGRESS" | "DONE";
-  user: {
-    first_name: string;
-    last_name: string;
-  };
-  latestComment?: {
-    message: string;
-    user: {
-      first_name: string;
-    };
-  };
 };
+
+type TaskGroups = {
+  todo: Task[];
+  inProgress: Task[];
+  done: Task[];
+};
+
+type TaskGroupKey = keyof TaskGroups; // "todo" | "inProgress" | "done"
 
 export default function DashboardPage() {
   const [groupedTasks, setGroupedTasks] = useState({
@@ -37,82 +47,193 @@ export default function DashboardPage() {
   });
 
   const [loading, setLoading] = useState(true);
-  const [user , setUser] = useState<any>(null);
+  const [user, setUser] = useState<any>(null);
 
+  // 🔹 Fetch initial data
   useEffect(() => {
-  const fetchData = async () => {
-    try {
-      const [taskRes, userRes] = await Promise.all([
-        task(),
-        getProfile(),
-      ]);
+    const fetchData = async () => {
+      try {
+        const [taskRes, userRes] = await Promise.all([
+          task(),
+          getProfile(),
+        ]);
 
-      const tasks: Task[] = taskRes.data?.data || taskRes;
+        const tasks: Task[] = taskRes?.data?.data || taskRes;
 
-      const grouped = {
-        todo: tasks.filter((t) => t.status === "TODO"),
-        inProgress: tasks.filter((t) => t.status === "IN_PROGRESS"),
-        done: tasks.filter((t) => t.status === "DONE"),
-      };
+        setGroupedTasks({
+          todo: tasks.filter((t) => t.status === "TODO"),
+          inProgress: tasks.filter((t) => t.status === "IN_PROGRESS"),
+          done: tasks.filter((t) => t.status === "DONE"),
+        });
 
-      setGroupedTasks(grouped);
-      setUser(userRes.data || userRes); // 👈 store user
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
-  };
+        setUser(userRes?.data || userRes);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoading(false);
+      }
+    };
 
-  fetchData();
-}, []);
+    fetchData();
+  }, []);
 
-  const handleDeleteTask = (uid: string) => {
-    setGroupedTasks((prev) => ({
+  // 🔹 SOCKET CONNECTION
+  useEffect(() => {
+    if (!user) return;
+
+    socket.emit("join_company", user.company_id);
+
+    const handleTaskUpdate = ({ uid, status }: any) => {
+      setGroupedTasks((prev) => {
+        let movedTask: any;
+
+        const newState = {
+          todo: [...prev.todo],
+          inProgress: [...prev.inProgress],
+          done: [...prev.done],
+        };
+
+        (Object.keys(newState) as TaskGroupKey[]).forEach((key) => {
+          newState[key] = newState[key].filter((t) => {
+            if (t.uid === uid) {
+              movedTask = t;
+              return false;
+            }
+            return true;
+          });
+        });
+
+        if (!movedTask) return prev;
+        if (movedTask.status === status) return prev;
+
+        const updatedTask = { ...movedTask, status };
+
+        if (status === "TODO") newState.todo.push(updatedTask);
+        if (status === "IN_PROGRESS") newState.inProgress.push(updatedTask);
+        if (status === "DONE") newState.done.push(updatedTask);
+
+        return newState;
+      });
+    };
+
+    const handleTaskCreate = (task: Task) => {
+      setGroupedTasks((prev) => ({
+        ...prev,
+        todo: [task, ...prev.todo],
+      }));
+    };
+
+    const handleTaskDelete = ({ uid }: any) => {
+      setGroupedTasks((prev) => ({
         todo: prev.todo.filter((t) => t.uid !== uid),
         inProgress: prev.inProgress.filter((t) => t.uid !== uid),
         done: prev.done.filter((t) => t.uid !== uid),
-    }));
+      }));
     };
 
-  if (loading) {
-    return <KanbanSkeleton />;
-  }
+    socket.on("task_updated", handleTaskUpdate);
+    socket.on("task_created", handleTaskCreate);
+    socket.on("task_deleted", handleTaskDelete);
+
+    return () => {
+      socket.off("task_updated", handleTaskUpdate);
+      socket.off("task_created", handleTaskCreate);
+      socket.off("task_deleted", handleTaskDelete);
+    };
+  }, [user]);
+
+  const handleDeleteTask = (uid: string) => {
+    setGroupedTasks((prev) => ({
+      todo: prev.todo.filter((t) => t.uid !== uid),
+      inProgress: prev.inProgress.filter((t) => t.uid !== uid),
+      done: prev.done.filter((t) => t.uid !== uid),
+    }));
+  };
+
+  if (loading) return <KanbanSkeleton />;
+
+  // 🔹 Drag & Drop
+  const handleDragEnd = async (event: any) => {
+    const { active, over } = event;
+    if (!over) return;
+
+    const taskId = active.id;
+    const newStatus = over.id;
+
+    const movedTask = [
+      ...groupedTasks.todo,
+      ...groupedTasks.inProgress,
+      ...groupedTasks.done,
+    ].find((t) => t.uid === taskId);
+
+    if (!movedTask || movedTask.status === newStatus) return;
+
+    const canUpdate =
+      user?.role === "MANAGER" || movedTask.user_id === user?.id;
+
+    if (!canUpdate) {
+      alert("Not allowed");
+      return;
+    }
+
+    // optimistic update
+    setGroupedTasks((prev) => {
+      const newState = {
+        todo: prev.todo.filter((t) => t.uid !== taskId),
+        inProgress: prev.inProgress.filter((t) => t.uid !== taskId),
+        done: prev.done.filter((t) => t.uid !== taskId),
+      };
+
+      const updatedTask = { ...movedTask, status: newStatus };
+
+      if (newStatus === "TODO") newState.todo.push(updatedTask);
+      if (newStatus === "IN_PROGRESS") newState.inProgress.push(updatedTask);
+      if (newStatus === "DONE") newState.done.push(updatedTask);
+
+      return newState;
+    });
+
+    try {
+      await updateTask(taskId, { status: newStatus });
+    } catch (err) {
+      console.error(err);
+    }
+  };
 
   return (
     <div className="h-full overflow-x-auto bg-[#f9f9f9] flex justify-center">
-      <div className="flex gap-8 h-full w-fit p-6">
-
-        <Column title="To Do" tasks={groupedTasks.todo} onDelete={handleDeleteTask} user={user} />
-        <Column title="In Progress" tasks={groupedTasks.inProgress} onDelete={handleDeleteTask} user={user} />
-        <Column title="Done" tasks={groupedTasks.done} onDelete={handleDeleteTask} user={user} />
-
-      </div>
+      <DndContext collisionDetection={closestCorners} onDragEnd={handleDragEnd}>
+        <div className="flex gap-8 h-full w-fit p-6">
+          <Column id="TODO" title="To Do" tasks={groupedTasks.todo} onDelete={handleDeleteTask} user={user} />
+          <Column id="IN_PROGRESS" title="In Progress" tasks={groupedTasks.inProgress} onDelete={handleDeleteTask} user={user} />
+          <Column id="DONE" title="Done" tasks={groupedTasks.done} onDelete={handleDeleteTask} user={user} />
+        </div>
+      </DndContext>
     </div>
   );
 }
 
-function Column({ title, tasks, onDelete, user }: { title: string; tasks: Task[]; onDelete: (uid: string) => void; user: any; }) {
-    return (
-        <section className="flex flex-col w-[480px] h-full">
-            <header className="flex justify-between items-center mb-6 px-2">
-                <h2 className="font-bold text-xs uppercase tracking-widest text-black">
-                    {title} ({tasks.length})
-                </h2>
-            </header>
+// ---------------- COLUMN ----------------
+function Column({ id, title, tasks, onDelete, user }: any) {
+  const { setNodeRef } = useDroppable({ id });
 
-            <div
-                className="flex flex-col gap-6 bg-[#f3f3f3] p-4 rounded-xl flex-1 overflow-y-auto [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:w-0 [&::-webkit-scrollbar]:h-0"
-            >
-                {tasks.map((task: Task) => (
-                    <TaskCard key={task.id} task={task} onDelete={onDelete} user={user} />
-                ))}
-            </div>
-        </section>
-    );
+  return (
+    <section ref={setNodeRef} className="flex flex-col w-[480px] h-full">
+      <h2 className="mb-6 text-xs font-bold uppercase px-2">
+        {title} ({tasks.length})
+      </h2>
+
+      <div className="flex flex-col gap-6 bg-[#f3f3f3] p-4 rounded-xl flex-1 overflow-y-auto scrollbar-hide">
+        {tasks.map((task: Task) => (
+          <TaskCard key={task.uid} task={task} onDelete={onDelete} user={user} />
+        ))}
+      </div>
+    </section>
+  );
 }
 
-function TaskCard({ task, onDelete, user }: { task: any; onDelete: (uid: string) => void; user: any; }) {
+// ---------------- TASK CARD ----------------
+function TaskCard({ task, onDelete, user }: any) {
   const [showInput, setShowInput] = useState(false);
   const [showComments, setShowComments] = useState(false);
   const [comment, setComment] = useState("");
@@ -120,28 +241,42 @@ function TaskCard({ task, onDelete, user }: { task: any; onDelete: (uid: string)
   const [loadingComments, setLoadingComments] = useState(false);
   const [commentsLoaded, setCommentsLoaded] = useState(false);
 
-  const canDelete = user?.role === "MANAGER" || task.user_id === user?.id;
+  const canDelete =
+    user?.role === "MANAGER" || task.user_id === user?.id;
 
-  // fetch comments only when opened
+  // 🔹 Fetch comments
   useEffect(() => {
-  if (!showComments || commentsLoaded) return;
+    if (!showComments || commentsLoaded) return;
 
-  const fetchComments = async () => {
-    setLoadingComments(true);
+    const fetchComments = async () => {
+      setLoadingComments(true);
+      try {
+        const res = await getComments(task.uid);
+        setComments(res?.data?.data || []);
+        setCommentsLoaded(true);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoadingComments(false);
+      }
+    };
 
-    try {
-      const res = await getComments(task.uid);
-      setComments(res.data || res);
-      setCommentsLoaded(true); 
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoadingComments(false);
-    }
+    fetchComments();
+  }, [showComments, commentsLoaded, task.uid]);
+
+  // 🔹 Socket comment
+  useEffect(() => {
+  const handleCommentAdded = (c: any) => {
+    if (c.task_uid !== task.uid) return;
+    setComments((prev) => [c, ...prev]);
   };
 
-  fetchComments();
-}, [showComments, commentsLoaded, task.uid]);
+  socket.on("comment_added", handleCommentAdded);
+
+  return () => {
+    socket.off("comment_added", handleCommentAdded);
+  };
+}, [task.uid]);
 
   const handleAddComment = async () => {
     if (!comment.trim()) return;
@@ -149,11 +284,10 @@ function TaskCard({ task, onDelete, user }: { task: any; onDelete: (uid: string)
     const temp = {
       uid: Date.now(),
       message: comment,
-      user: { first_name: "You", last_name: "" },
+      user: { first_name: "You" },
       replies: [],
     };
 
-    // optimistic update
     setComments((prev) => [temp, ...prev]);
     setComment("");
     setShowInput(false);
@@ -169,100 +303,132 @@ function TaskCard({ task, onDelete, user }: { task: any; onDelete: (uid: string)
     if (!confirm("Delete this task?")) return;
 
     try {
-        await deleteTask(task.uid);
-        onDelete(task.uid);
+      await deleteTask(task.uid);
+      onDelete(task.uid);
     } catch (err) {
-        console.error(err);
+      console.error(err);
     }
-    };
+  };
+
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+    id: task.uid,
+  });
+
+  const style = {
+    transform: transform
+      ? `translate(${transform.x}px, ${transform.y}px)`
+      : undefined,
+    opacity: isDragging ? 0.5 : 1,
+    transition: isDragging ? "none" : "opacity 0.2s ease-in-out",
+    zIndex: isDragging ? 1000 : "auto",
+  };
 
   return (
-    <div className="bg-white p-6 rounded-xl border hover:border-gray-300 transition relative">
-
-    {canDelete && (
+    <div
+      ref={setNodeRef}
+      style={style}
+      {...listeners}
+      {...attributes}
+      className={`bg-white p-6 rounded-xl border hover:border-gray-300 relative cursor-grab active:cursor-grabbing transition ${
+        isDragging ? "border-blue-400 bg-blue-50 shadow-2xl" : ""
+      }`}
+    >
+      {canDelete && (
         <button
-            onClick={handleDelete}
-            className="absolute top-4 right-4 text-gray-400 hover:text-red-500"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            handleDelete();
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+          className="absolute top-4 right-4 text-gray-400 hover:text-red-500 cursor-pointer pointer-events-auto"
         >
-            <Trash2 size={18} />
+          <Trash2 size={18} />
         </button>
-        )}
+      )}
 
-      {/* Title */}
-      <h3 className="font-semibold text-lg mb-1">
-        {task.title}
-      </h3>
+      <h3 className="font-semibold text-lg">{task.title}</h3>
+      <p className="text-sm text-gray-500">{task.description}</p>
 
-      {/* Description */}
-      <p className="text-sm text-gray-500 mb-2">
-        {task.description}
-      </p>
-
-      {/* Assigned */}
-      <p className="text-xs text-gray-400 mb-4">
+      <p className="text-xs text-gray-400 mt-2">
         Assigned by:{" "}
         {task.assignment_type === "SELF"
           ? "Self"
-          : `${task.assigned_by?.first_name || ""}`}
+          : task.assigned_by?.first_name || "—"}
       </p>
 
-      {/* Actions */}
-      <div className="flex justify-between text-sm mb-3">
-        <button
-          onClick={() => setShowInput((prev) => !prev)}
-          className="text-gray-500 hover:text-black"
+      <div className="flex justify-between text-sm mt-3 pointer-events-auto">
+        <button 
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setShowInput((p) => !p);
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+          className="text-gray-500 hover:text-black cursor-pointer pointer-events-auto"
         >
           + Comment
         </button>
-
-        <button
-          onClick={() => setShowComments((prev) => !prev)}
-          className="text-gray-500 hover:text-black"
+        <button 
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setShowComments((p) => !p);
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+          className="text-gray-500 hover:text-black cursor-pointer pointer-events-auto"
         >
-          {showComments ? "Hide Comments" : "Show Comments"}
+          {showComments ? "Hide" : "Show"} Comments
         </button>
       </div>
 
-      {/* Input */}
       {showInput && (
-        <div className="flex items-center gap-2 mb-3">
+        <div className="flex gap-2 mt-2 pointer-events-auto">
           <input
             value={comment}
             onChange={(e) => setComment(e.target.value)}
-            placeholder="Write a comment..."
-            className="flex-1 text-sm border-b outline-none py-1"
             onKeyDown={(e) => {
+              e.stopPropagation();
               if (e.key === "Enter") handleAddComment();
             }}
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+            className="flex-1 text-sm border-b outline-none pointer-events-auto"
+            placeholder="Write comment..."
+            autoFocus
           />
-
-          <button onClick={handleAddComment}>
+          <button
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              handleAddComment();
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+            className="cursor-pointer pointer-events-auto hover:text-black transition"
+          >
             <SendIcon />
           </button>
         </div>
       )}
 
-      {/* Comments Thread */}
       {showComments && (
         <div className="mt-3">
-
-            {loadingComments && !commentsLoaded ? (
+          {loadingComments ? (
             <CommentSkeleton />
-            ) : comments.length === 0 ? (
+          ) : comments.length === 0 ? (
             <p className="text-xs text-gray-400">No comments</p>
-            ) : (
+          ) : (
             comments.map((c) => (
-                <CommentItem key={c.uid} comment={c} taskUid={task.uid} />
+              <CommentItem key={c.uid} comment={c} taskUid={task.uid} />
             ))
-            )}
-
+          )}
         </div>
-        )}
+      )}
     </div>
   );
 }
 
-
+// ---------------- COMMENTS ----------------
 function CommentItem({ comment, taskUid, depth = 0 }: any) {
   const [showReply, setShowReply] = useState(false);
   const [reply, setReply] = useState("");
@@ -290,45 +456,53 @@ function CommentItem({ comment, taskUid, depth = 0 }: any) {
   };
 
   return (
-    <div
-      className="mt-2"
-      style={{ marginLeft: depth * 12 }} // indentation
-    >
-      {/* Comment */}
+    <div style={{ marginLeft: depth * 12 }} className="mt-2">
       <div className="bg-gray-100 p-2 rounded">
-        <p className="text-xs text-gray-500">
-          {comment.user?.first_name}
-        </p>
+        <p className="text-xs font-semibold">{comment.user?.first_name}</p>
         <p className="text-sm">{comment.message}</p>
       </div>
 
-      {/* Reply toggle */}
       <button
-        onClick={() => setShowReply((prev) => !prev)}
-        className="text-xs text-gray-400 mt-1"
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setShowReply((p) => !p);
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+        className="text-xs text-gray-500 hover:text-gray-700 mt-1 cursor-pointer pointer-events-auto"
       >
-        Reply
+        {showReply ? "Cancel" : "Reply"}
       </button>
 
-      {/* Reply input */}
       {showReply && (
-        <div className="flex gap-2 mt-1">
+        <div className="flex gap-2 mt-2 pointer-events-auto">
           <input
             value={reply}
             onChange={(e) => setReply(e.target.value)}
-            className="text-xs border-b flex-1 outline-none"
-            placeholder="Reply..."
             onKeyDown={(e) => {
+              e.stopPropagation();
               if (e.key === "Enter") handleReply();
             }}
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+            className="text-xs border-b flex-1 outline-none pointer-events-auto"
+            placeholder="Write reply..."
+            autoFocus
           />
-          <button onClick={handleReply}>
+          <button
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              handleReply();
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+            className="cursor-pointer pointer-events-auto hover:text-black transition"
+          >
             <SendIcon />
           </button>
         </div>
       )}
 
-      {/* 🔥 Recursive rendering */}
       {replies.length > 0 && (
         <div className="mt-2">
           {replies.map((r: any) => (

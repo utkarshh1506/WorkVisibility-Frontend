@@ -43,3 +43,8 @@ export const deleteTask = async (taskUid: string) => {
     const res = await api.patch(`/api/task/delete-task/${taskUid}`);
     return res.data;
 }
+
+export const updateTask = async (taskUid: string, data:{status: string})=>{
+    const res = await api.patch(`/api/task/update-status/${taskUid}`, data);
+    return res.data;
+}

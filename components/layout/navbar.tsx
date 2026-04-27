@@ -96,7 +96,7 @@ export default function Navbar() {
 
             <button
               className="w-full text-left px-3 py-2 hover:bg-gray-100 rounded"
-              onClick={() => router.push("/dashboard/profile")}
+              onClick={() => router.push("/profile")}
             >
               Profile
             </button>
